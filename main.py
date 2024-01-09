@@ -42,7 +42,7 @@ def end2end(prompt, model, tokenizer):
     return outputs, inputs['labels']
 
 
-def generate_quiz_choices(instruction, paras, original):
+def construct_quiz(instruction, paras, original):
     options = paras.copy()
 
     rand_idx = np.random.randint(0, len(paras) + 1)
@@ -50,15 +50,12 @@ def generate_quiz_choices(instruction, paras, original):
     option_letters = ['A', 'B', 'C', 'D']
     original_letter = option_letters[rand_idx]
     
-    option_str = '\n'.join(
-        f'{a}) {b}' for a, b in zip(option_letters, options)
+    option_str = '\n--\n'.join(
+        f'Letter Choice {a})\n{b}' for a, b in zip(option_letters, options)
     )
 
-    prompt = f'{instruction}\n--\n{option_str}\n--\nAnswer: '
-    all_options = [
-        prompt + l for l in option_letters
-    ]
-    return all_options, original_letter
+    prompt = f'{instruction}\n--\n{option_str}\n--\nLetter Choice corresponding to an instance from the test set:'
+    return prompt, option_letters, original_letter
 
 
 if __name__ == '__main__':
@@ -85,17 +82,19 @@ if __name__ == '__main__':
 
     tokenizer = AutoTokenizer.from_pretrained(MODEL_DICT[args.model], trust_remote_code=True)
     #  flash_attn=True,
-    model = AutoModelForCausalLM.from_pretrained(MODEL_DICT[args.model], trust_remote_code=True).eval().to(args.device)
+    model = AutoModelForCausalLM.from_pretrained(MODEL_DICT[args.model], torch_dtype='auto', trust_remote_code=True).eval().to(args.device)
 
     ref_tokenizer = AutoTokenizer.from_pretrained(MODEL_DICT[args.ref_model], trust_remote_code=True)
     #  flash_attn=True,
-    ref_model = AutoModelForCausalLM.from_pretrained(MODEL_DICT[args.ref_model], trust_remote_code=True).eval().to(args.device)
+    ref_model = AutoModelForCausalLM.from_pretrained(MODEL_DICT[args.ref_model], torch_dtype='auto', trust_remote_code=True).eval().to(args.device)
 
     stats = []
 
     for idx, example in tqdm(enumerate(dataset)):
         prompt = build_prompt(example, dataset_name=args.dataset, paraphrases=False)
         paraphrase_prompts = build_prompt(example, dataset_name=args.dataset, paraphrases=True)
+        n_para = len(paraphrase_prompts)
+        assert n_para >= 3  # Necessary for 4-choice quiz
 
         outputs, labels = end2end(prompt, model, tokenizer)
         outputs_lower, labels_lower = end2end(prompt.lower(), model, tokenizer)
@@ -115,14 +114,20 @@ if __name__ == '__main__':
 
         ppl = torch.exp(outputs.loss)
 
-        quiz_prompt_choices = generate_quiz_choices(quiz_instruction, paraphrase_prompts, prompt)
+        quiz_prompt, option_letters, original_letter = construct_quiz(quiz_instruction, paraphrase_prompts[:min(n_para, 3)], prompt)
 
-        end2end(quiz_prompt, model, tokenizer)
+        quiz_output, _ = end2end(quiz_prompt, model, tokenizer)
+        option_ids = tokenizer.convert_tokens_to_ids([' ' + l for l in option_letters])
+        quiz_final_logit = quiz_output.logits[0, -1, :]
+        quiz_pred_letter = option_letters[int(torch.argmax(quiz_final_logit[option_ids]))]
+
+        quiz_score = 1 if quiz_pred_letter == original_letter else 0
 
         row = {
             'idx': idx,
             'min_k':  min_k_lprobs,
             'ppl': ppl,
+            'quiz_score': quiz_score,
         }
 
         stats.append(row)
