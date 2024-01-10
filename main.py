@@ -4,6 +4,7 @@ import zlib
 
 import argparse
 from datasets import load_dataset
+from evaluate import load
 import numpy as np
 import pandas as pd
 import torch
@@ -66,9 +67,10 @@ def generate(prompts, model, tokenizer):
     inputs = {k: v.to(model.device) for k, v in inputs.items()}
 
     with torch.no_grad():
-        outputs = model.generate(**inputs)
-    # TODO decode
-    return outputs.sequences
+        output_ids = model.generate(**inputs)
+    
+    generated_text = tokenizer.batch_decode(output_ids, skip_special_tokens=True)
+    return generated_text
 
 
 def end2end(prompt, model, tokenizer):
@@ -135,6 +137,8 @@ if __name__ == '__main__':
     guided_instruction = GUIDED_TEMPLATE.format(INPUT_TYPE_DICT[args.dataset], args.split, args.dataset)
     general_instruction = GENERAL_TEMPLATE.format(INPUT_TYPE_DICT[args.dataset])
 
+    bleurt = load('bleurt', keep_in_memory=True)
+
     tokenizer = AutoTokenizer.from_pretrained(MODEL_DICT[args.model], trust_remote_code=True)
     #  flash_attn=True,
     model = AutoModelForCausalLM.from_pretrained(MODEL_DICT[args.model], torch_dtype='auto', trust_remote_code=True).eval().to(args.device)
@@ -162,7 +166,9 @@ if __name__ == '__main__':
         # PAPER: Time Travel in LLMs: Tracing Data Contamination in Large Language Models
         # LINK: https://arxiv.org/abs/2308.08493
         guided_prompt = construct_qg_prompt(guided_instruction)
-        general_instruction = construct_qg_prompt(general_instruction)
+        general_prompt = construct_qg_prompt(general_instruction)
+        guided_q, general_q = generate([guided_prompt, general_prompt], model, tokenizer)
+        guided_bluert, general_bluert  = bleurt.compute(predictions=[guided_q, general_q], references=[example['QUESTION'], example['QUESTION']])['scores']
 
         # Truncate last token logit
         shifted_logits = outputs.logits[0, :-1]
@@ -207,6 +213,8 @@ if __name__ == '__main__':
 
         row = {
             'idx': idx,
+            'guided_bluert': guided_bluert,
+            'general_bluert': general_bluert,
             'min_k':  min_k_lprobs,
             'quiz_score': quiz_score,
             'neighbor_loss_delta': neighbor_loss_delta,
