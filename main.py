@@ -18,6 +18,7 @@ INPUT_TYPE_DICT = {
     'pubmedqa': 'a set of relevant PubMed abstracts',
     'medmcqa': 'a set of multiple choice options and an answer',
     'mmlu_clinical_knowledge': 'a set of multiple choice options and an answer',
+    'mmlu_anatomy': 'a set of multiple choice options and an answer',
 }
 
 
@@ -44,7 +45,8 @@ IS_CHAT = {
 DATASET_DICT = {
     'pubmedqa': ('bigbio/pubmed_qa', 'pubmed_qa_labeled_fold0_source'),
     'medmcqa': ('medmcqa', ),
-    'mmlu_clinical_knowledge': ('lukaemon/mmlu', 'clinical_knowledges')
+    'mmlu_clinical_knowledge': ('lukaemon/mmlu', 'clinical_knowledge'),
+    'mmlu_anatomy': ('lukaemon/mmlu', 'anatomy'),
 }
 
 
@@ -52,6 +54,7 @@ EVAL_SPLIT = {
     'pubmedqa': 'test',
     'medmcqa': 'validation',
     'mmlu_clinical_knowledge': 'test',
+    'mmlu_anatomy': 'test',
 }
 
 
@@ -158,7 +161,7 @@ def construct_medmcqa_qg_input(example):
     return '\n'.join(prompt_lines)
 
 
-def construct_mmmlu_qg_input(example):
+def construct_mmlu_qg_input(example):
     choice_letters = ['A', 'B', 'C', 'D']
     choice_options = [example[l] for l in choice_letters]
 
@@ -245,6 +248,9 @@ if __name__ == '__main__':
         elif args.dataset == 'medmcqa':
             partial_input = construct_medmcqa_qg_input(example)
             reference = example['question']
+        elif 'mmlu' in args.dataset:
+            partial_input = construct_mmlu_qg_input(example)
+            reference = example['input']
 
         guided_q = chat_completion(f'{guided_instruction}\n\n{partial_input}', model, tokenizer)
         general_q = chat_completion(f'{general_instruction}\n\n{partial_input}', model, tokenizer)

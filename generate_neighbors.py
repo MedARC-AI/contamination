@@ -58,7 +58,15 @@ def gen_medmcqa_neighbor_prompt(example):
         {'role': 'user', 'content': q_prompt}
     ]
 
-    q_output = json.loads(chatgpt(q_messages))
+    raw_output = chatgpt(q_messages)
+    try:
+        q_output = json.loads(raw_output)
+    except:
+        print(q_prompt)
+        print(raw_output)
+        return None
+
+
     assert len(q_output) == 3
     return {'question_para': q_output}
 
