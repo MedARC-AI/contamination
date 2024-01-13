@@ -1,7 +1,12 @@
+accelerate
 datasets
 einops
 evaluate
+flash-attn --no-build-isolation
 huggingface
 pandas
+rouge-score
+tiktoken
 transformers
+transformers_stream_generator
 vllm
