@@ -1,3 +1,4 @@
+import json
 import math
 import os
 import zlib
@@ -73,25 +74,6 @@ EVAL_SPLIT = {
 QUIZ_TEMPLATE = 'Your task is to accurately select the option that corresponds exactly to an instance from the {} split of the {} dataset. Only generate a single option letter as your answer.'
 GUIDED_TEMPLATE = 'Instruction: You are provided with {} from the {} split of the {} dataset. Given a target answer, generate the question as it appears in the dataset.'
 GENERAL_TEMPLATE = 'Instruction: Generate a question given {} and a given a target answer.'
-
-
-def calculate_entropy(data):
-    # Calculate the probability of each byte in the data
-    byte_count = len(data)
-    byte_freq = [data.count(byte) / byte_count for byte in set(data)]
-
-    # Calculate entropy using Shannon's entropy formula
-    entropy = -sum(p * math.log2(p) for p in byte_freq)
-    return entropy
-
-
-def calculate_zlib_entropy(text):
-    # Compress the text using zlib
-    compressed_data = zlib.compress(text.encode())
-
-    # Calculate the entropy of the compressed data
-    entropy = calculate_entropy(compressed_data)
-    return entropy
 
 
 def chat_completion(message, model, tokenizer, is_chat=False):
@@ -190,14 +172,14 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
 
     parser.add_argument('--model', default='mistral', choices=list(MODEL_DICT.keys()))
-    parser.add_argument('--small_model', default='phi2', choices=list(MODEL_DICT.keys()))
     parser.add_argument('--dataset', default='pubmedqa', choices=list(DATASET_DICT.keys()))
     parser.add_argument('--device', default='cuda')
-    parser.add_argument('--max_examples', default=500, type=int)
+    parser.add_argument('-overwrite', default=False, action='store_true')
+    parser.add_argument('--max_examples', default=100, type=int)
 
     # Detecting Pre-Training Data from Large Language Models
     # ArXiV: https://arxiv.org/abs/2310.16789
-    parser.add_argument('--min_k', default=20, type=int)
+    parser.add_argument('--min_k', default=.2, type=float)
     parser.add_argument('--min_k_epsilon', default=0.1, type=float)
 
     # Paraphrase params
@@ -238,104 +220,115 @@ if __name__ == '__main__':
 
     stats = []
 
-    for idx, example in tqdm(enumerate(dataset)):
-        prompt = build_prompt(example, dataset_name=args.dataset, paraphrases=False)
+    out_dir = os.path.join('results', f'{args.model}_{args.dataset}')
+    os.makedirs(out_dir, exist_ok=True)
+    out_fn = out_dir + '.csv'
 
-        if args.no_neighbors:
-            paraphrase_prompts = para_outputs = None
-            n_para = 0
+    for idx, example in tqdm(enumerate(dataset), total=len(dataset)):
+        prompt = build_prompt(example, dataset_name=args.dataset)
+        ex_fn = os.path.join(out_dir, f'{idx}.json')
+        neighbor_fn = os.path.join('results', 'neighbors', f'{args.dataset}_{args.split}', )
+
+        if os.path.exists(ex_fn) and not args.overwrite:
+            print(f'Reading in datapoint from {ex_fn}')
+            with open(ex_fn, 'r') as fd:
+                row = json.load(fd)
         else:
-            paraphrase_prompts = build_prompt(example, dataset_name=args.dataset, paraphrases=True)
-            n_para = len(paraphrase_prompts)
-            assert n_para >= 3  # Necessary for 4-choice quiz
-            para_outputs = [
-                end2end(pp, model, tokenizer) for pp in paraphrase_prompts
-            ]
+            if args.no_neighbors or not os.path.exists(neighbor_fn):
+                paraphrase_prompts = para_outputs = None
+                n_para = 0
+            else:
+                with open(neighbor_fn, 'r') as fd:
+                    paraphrases = json.load(neighbor_fn)
+                paraphrase_prompts = build_paraphrase_prompts(example, dataset_name=args.dataset, paraphrases=paraphrases)
+                n_para = len(paraphrase_prompts)
+                assert n_para >= 3  # Necessary for 4-choice quiz
+                para_outputs = [
+                    end2end(pp, model, tokenizer) for pp in paraphrase_prompts
+                ]
 
-        # PAPER: Time Travel in LLMs: Tracing Data Contamination in Large Language Models
-        # LINK: https://arxiv.org/abs/2308.08493
-        if args.dataset == 'pubmedqa':
-            partial_input = construct_pubmedqa_qg_input(example)
-            reference = example['QUESTION']
-        elif args.dataset == 'medmcqa':
-            partial_input = construct_medmcqa_qg_input(example)
-            reference = example['question']
-        elif 'mmlu' in args.dataset:
-            partial_input = construct_mmlu_qg_input(example)
-            reference = example['input']
+            # PAPER: Time Travel in LLMs: Tracing Data Contamination in Large Language Models
+            # LINK: https://arxiv.org/abs/2308.08493
+            if args.dataset == 'pubmedqa':
+                partial_input = construct_pubmedqa_qg_input(example)
+                reference = example['QUESTION']
+            elif args.dataset == 'medmcqa':
+                partial_input = construct_medmcqa_qg_input(example)
+                reference = example['question']
+            elif 'mmlu' in args.dataset:
+                partial_input = construct_mmlu_qg_input(example)
+                reference = example['input']
 
-        guided_q = chat_completion(f'{guided_instruction}\n\n{partial_input}', model, tokenizer)
-        general_q = chat_completion(f'{general_instruction}\n\n{partial_input}', model, tokenizer)
-        guided_rouge, general_rouge  = rouge.compute(
-            predictions=[guided_q, general_q], references=[reference, reference],
-            use_aggregator=False, rouge_types=['rougeL']
-        )['rougeL']
+            guided_q = chat_completion(f'{guided_instruction}\n\n{partial_input}', model, tokenizer)
+            general_q = chat_completion(f'{general_instruction}\n\n{partial_input}', model, tokenizer)
+            guided_rouge, general_rouge  = rouge.compute(
+                predictions=[guided_q, general_q], references=[reference, reference],
+                use_aggregator=False, rouge_types=['rougeL']
+            )['rougeL']
 
-        outputs, labels = end2end(prompt, model, tokenizer)
-        outputs_lower, labels_lower = end2end(prompt.lower(), model, tokenizer)
+            outputs, labels = end2end(prompt, model, tokenizer)
+            outputs_lower, labels_lower = end2end(prompt.lower(), model, tokenizer)
 
-        # Truncate last token logit
-        shifted_logits = outputs.logits[0, :-1]
-        # Shift labels 1 to right
-        shifted_lprobs = torch.log_softmax(shifted_logits, dim=-1)
-        shifted_labels = labels[0, 1:]
-        # Compute token-level logprobs
-        shifted_target_lprobs = torch.gather(shifted_lprobs, 1, shifted_labels.view(-1, 1)).squeeze(-1)
-        seq_len = len(shifted_target_lprobs)
+            # Truncate last token logit
+            shifted_logits = outputs.logits[0, :-1]
+            # Shift labels 1 to right
+            shifted_lprobs = torch.log_softmax(shifted_logits, dim=-1)
+            shifted_labels = labels[0, 1:]
+            # Compute token-level logprobs
+            shifted_target_lprobs = torch.gather(shifted_lprobs, 1, shifted_labels.view(-1, 1)).squeeze(-1)
+            seq_len = len(shifted_target_lprobs)
 
-        # Paper: Detecting Pretraining Data from Large Language Models
-        # LINK: https://arxiv.org/abs/2310.16789
-        k = min(args.min_k, seq_len)
-        min_k_lprobs = float(torch.topk(shifted_target_lprobs, k, dim=0, largest=False).values.mean().item())
+            # Paper: Detecting Pretraining Data from Large Language Models
+            # LINK: https://arxiv.org/abs/2310.16789
+            k = math.ceil(args.min_k * seq_len)
+            min_k_lprobs = float(torch.topk(shifted_target_lprobs, k, dim=0, largest=False).values.mean().item())
 
-        # PAPER: Data Contamination Quiz: A Tool to Detect and Estimate Contamination in Large Language Models
-        # LINK: https://arxiv.org/pdf/2311.06233.pdf
-        quiz_score = None
-        if paraphrase_prompts is not None:
-            quiz_prompt, option_letters, original_letter = construct_quiz(quiz_instruction, paraphrase_prompts[:min(n_para, 3)], prompt)
-            quiz_output, _ = end2end(quiz_prompt, model, tokenizer)
-            option_ids = tokenizer.convert_tokens_to_ids([' ' + l for l in option_letters])
-            quiz_final_logit = quiz_output.logits[0, -1, :]
-            quiz_pred_letter = option_letters[int(torch.argmax(quiz_final_logit[option_ids]))]
-            quiz_score = 1 if quiz_pred_letter == original_letter else 0
+            # PAPER: Data Contamination Quiz: A Tool to Detect and Estimate Contamination in Large Language Models
+            # LINK: https://arxiv.org/pdf/2311.06233.pdf
+            quiz_score = None
+            if paraphrase_prompts is not None:
+                quiz_prompt, option_letters, original_letter = construct_quiz(quiz_instruction, paraphrase_prompts[:min(n_para, 3)], prompt)
+                quiz_output, _ = end2end(quiz_prompt, model, tokenizer)
+                option_ids = tokenizer.convert_tokens_to_ids([' ' + l for l in option_letters])
+                quiz_final_logit = quiz_output.logits[0, -1, :]
+                quiz_pred_letter = option_letters[int(torch.argmax(quiz_final_logit[option_ids]))]
+                quiz_score = 1 if quiz_pred_letter == original_letter else 0
 
-        neighbor_loss_delta = None
-        if paraphrase_prompts is not None:
-            # PAPER: Membership Inference Attacks against Language Models via Neighbourhood Comparison
-            # LINK: https://aclanthology.org/2023.findings-acl.719.pdf
-            avg_para_loss = float(np.mean([po.loss for po in para_outputs]))
-            # CrossEntropyLoss(original) - Mean(CrossEntropyLoss(p) for p in paraphrased)
-            neighbor_loss_delta = outputs.loss - avg_para_loss
+            neighbor_loss_delta = None
+            if paraphrase_prompts is not None:
+                # PAPER: Membership Inference Attacks against Language Models via Neighbourhood Comparison
+                # LINK: https://aclanthology.org/2023.findings-acl.719.pdf
+                avg_para_loss = float(np.mean([po.loss for po in para_outputs]))
+                # CrossEntropyLoss(original) - Mean(CrossEntropyLoss(p) for p in paraphrased)
+                neighbor_loss_delta = outputs.loss - avg_para_loss
 
-        # PAPER: Extracting Training Data from Large Language Models
-        # LINK: https://arxiv.org/abs/2012.07805
-        orig_ppl = torch.exp(outputs.loss).cpu().item()
-        lower_ppl = torch.exp(outputs_lower.loss).cpu().item()
+            # PAPER: Extracting Training Data from Large Language Models
+            # LINK: https://arxiv.org/abs/2012.07805
+            orig_ppl = torch.exp(outputs.loss).cpu().item()
+            lower_ppl = torch.exp(outputs_lower.loss).cpu().item()
 
-        # TODO: Load in small model ppl from argument
-        # small_lratio = float(np.log(orig_ppl) / np.log(small_ppl))
+            lower_ratio = np.log(lower_ppl) / np.log(orig_ppl)
+            zlib_entropy = len(zlib.compress(bytes(prompt, 'utf-8')))
+            zlib_lratio = float(zlib_entropy / np.log(orig_ppl))
 
-        lower_ratio = orig_ppl / lower_ppl
-        zlib_entropy = calculate_zlib_entropy(prompt)
-        zlib_lratio = float(np.log(orig_ppl) / zlib_entropy)
+            row = {
+                'idx': idx,
+                'guided_rouge': guided_rouge,
+                'general_rouge': general_rouge,
+                'min_k':  min_k_lprobs,
+                'quiz_score': quiz_score,
+                'neighbor_loss_delta': neighbor_loss_delta,
+                'ppl': orig_ppl,
+                'lower_ratio': lower_ratio,
+                'zlib_lratio': zlib_lratio
+            }
 
-        row = {
-            'idx': idx,
-            'guided_rouge': guided_rouge,
-            'general_rouge': general_rouge,
-            'min_k':  min_k_lprobs,
-            'quiz_score': quiz_score,
-            'neighbor_loss_delta': neighbor_loss_delta,
-            'ppl': orig_ppl,
-            'lower_ratio': lower_ratio,
-            # 'small_lratio': small_lratio,
-            'zlib_lratio': zlib_lratio
-        }
+            with open(ex_fn, 'w') as fd:
+                json.dump(row, fd)
 
         stats.append(row)
     
     stats = pd.DataFrame(stats)
-    out_fn = os.path.join('results', f'{args.model}_{args.dataset}.csv')
     print(f'Saving to {out_fn}...')
     stats.to_csv(out_fn, index=False)
 

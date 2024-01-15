@@ -8,4 +8,3 @@ if __name__ == '__main__':
 		print(fn)
 		print(pd.read_csv(fn).select_dtypes('number').mean())
 		print('\n' + '-' * 50 + '\n')
-

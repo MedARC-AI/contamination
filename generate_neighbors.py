@@ -18,7 +18,7 @@ client = AzureOpenAI(
     api_key=os.environ.get('OPENAI_API_KEY'),
     azure_endpoint='https://east-us-2-llm.openai.azure.com/',
     api_version='2023-05-15',
-    azure_deployment='eval-4'
+    azure_deployment='misc-gpt4-turbo'
 )
 
 
@@ -38,33 +38,48 @@ Instruction: Your task is to generate 3 distinct paraphrases of the following {}
 (2) There is not any extra explanation; and
 (3) You comply with every specific symbol and letter detail in the given {}.
 
-Return a valid JSON list of strings whose length is 3. JSON must be valid.
+Return a JSON array of 3 strings.
 """).strip()
 
 
 def chatgpt(messages, model='gpt-4', temperature=0.1, max_tokens=2048):
     completion = client.with_options(max_retries=5).chat.completions.create(
         model=model, messages=messages, temperature=temperature, max_tokens=max_tokens,
+        response_format={'type': 'json_object'}
     )
-    return completion.choices[0].message.content
+    obj = json.loads(completion.choices[0].message.content)
+    if type(obj) == list:
+        return obj
+
+    if type(obj) == list:
+        return obj
+    elif 'paraphrases' in obj:
+        return obj['paraphrases']
+    elif 'paraphrase1' in obj:
+        return [
+            obj['paraphrase1'],
+            obj['paraphrase2'],
+            obj['paraphrase3'],
+        ]
+
+    print('Could not parse json')
+    return None 
 
 
-def gen_medmcqa_neighbor_prompt(example):
+def gen_mcqa_neighbor_prompt(example, q_col='question'):
     q_instruct = THREE_PARAPHRASE_INSTRUCTION.format('QUESTION', 'QUESTION')
-    q = example['question']
+    q = example[q_col]
     q_prompt = f'{q_instruct}\n\nQUESTION:\n{q}\n\n'
     q_messages = [
         {'role': 'system', 'content': 'You are a helpful assistant for text paraphrasing.'},
         {'role': 'user', 'content': q_prompt}
     ]
 
-    raw_output = chatgpt(q_messages)
+    q_output = chatgpt(q_messages)
     try:
-        q_output = json.loads(raw_output)
         assert len(q_output) == 3
     except:
         print(q_prompt)
-        print(raw_output)
         return None
 
     return {'question_para': q_output}
@@ -81,7 +96,7 @@ def gen_pubmedqa_neighbor_prompt(example):
         {'role': 'user', 'content': q_prompt}
     ]
 
-    q_output = json.loads(chatgpt(q_messages))
+    q_output = chatgpt(q_messages)
     assert len(q_output) == 3
 
     for ctx in example['CONTEXTS']:
@@ -92,12 +107,10 @@ def gen_pubmedqa_neighbor_prompt(example):
             {'role': 'user', 'content': ctx_prompt}
         ]
         try:
-            ctx_raw = chatgpt(ctx_messages)
-            ctx_output = json.loads(ctx_raw)
+            ctx_output = chatgpt(ctx_messages)
             assert len(ctx_output) == 3
         except:
             print(ctx_prompt)
-            print(ctx_raw)
             return None
 
         for i, o in enumerate(ctx_output):
@@ -114,6 +127,7 @@ if __name__ == '__main__':
 
     parser.add_argument('--model', default='gpt-4')
     parser.add_argument('--dataset', default='pubmedqa', choices=list(DATASET_DICT.keys()))
+    parser.add_argument('--max_examples', default=100, type=int)
 
     parser.add_argument('-overwrite', default=False, action='store_true')
 
@@ -128,6 +142,14 @@ if __name__ == '__main__':
 
     dataset = load_dataset(*DATASET_DICT[args.dataset])[args.split]
 
+    if len(dataset) > args.max_examples:
+        idxs = np.arange(len(dataset))
+        np.random.seed(1992)
+        np.random.shuffle(idxs)
+        print(f'Selecting a random subset of {args.max_examples} from {len(dataset)} examples.')
+        dataset = dataset.select(idxs[:args.max_examples])
+
+
     new_cols = []
     for idx, example in tqdm(enumerate(dataset), total=len(dataset)):
         out_fn = os.path.join(cache_dir, f'{idx}.json')
@@ -139,7 +161,9 @@ if __name__ == '__main__':
             if args.dataset == 'pubmedqa':
                 obj = gen_pubmedqa_neighbor_prompt(example)
             elif args.dataset == 'medmcqa':
-                obj = gen_medmcqa_neighbor_prompt(example)
+                obj = gen_mcqa_neighbor_prompt(example, q_col='question')
+            elif 'mmlu' in args.dataset:
+                obj = gen_mcqa_neighbor_prompt(example, q_col='input')
             if obj is None:
                 print(f'Unable to process {idx}...Moving on for now')
             else:
