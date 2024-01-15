@@ -19,6 +19,10 @@ INPUT_TYPE_DICT = {
     'medmcqa': 'a set of multiple choice options and an answer',
     'mmlu_clinical_knowledge': 'a set of multiple choice options and an answer',
     'mmlu_anatomy': 'a set of multiple choice options and an answer',
+    'mmlu_medical_genetics': 'a set of multiple choice options and an answer',
+    'mmlu_professional_medicine': 'a set of multiple choice options and an answer',
+    'mmlu_college_biology': 'a set of multiple choice options and an answer',
+    'mmlu_college_medicine': 'a set of multiple choice options and an answer',
 }
 
 
@@ -47,6 +51,10 @@ DATASET_DICT = {
     'medmcqa': ('medmcqa', ),
     'mmlu_clinical_knowledge': ('lukaemon/mmlu', 'clinical_knowledge'),
     'mmlu_anatomy': ('lukaemon/mmlu', 'anatomy'),
+    'mmlu_medical_genetics': ('lukaemon/mmlu', 'medical_genetics'),
+    'mmlu_professional_medicine': ('lukaemon/mmlu', 'professional_medicine'),
+    'mmlu_college_biology': ('lukaemon/mmlu', 'college_biology'),
+    'mmlu_college_medicine': ('lukaemon/mmlu', 'college_medicine'),
 }
 
 
@@ -55,6 +63,10 @@ EVAL_SPLIT = {
     'medmcqa': 'validation',
     'mmlu_clinical_knowledge': 'test',
     'mmlu_anatomy': 'test',
+    'mmlu_medical_genetics': 'test',
+    'mmlu_professional_medicine': 'test',
+    'mmlu_college_biology': 'test',
+    'mmlu_college_medicine': 'test',
 }
 
 

@@ -61,13 +61,12 @@ def gen_medmcqa_neighbor_prompt(example):
     raw_output = chatgpt(q_messages)
     try:
         q_output = json.loads(raw_output)
+        assert len(q_output) == 3
     except:
         print(q_prompt)
         print(raw_output)
         return None
 
-
-    assert len(q_output) == 3
     return {'question_para': q_output}
 
 
