@@ -1,37 +1,26 @@
+import argparse
 import json
 import os
-import regex as re
 
-import argparse
-from datasets import load_dataset
 import numpy as np
-from openai import AzureOpenAI
 import pandas as pd
+import regex as re
+from datasets import load_dataset
+from openai import AzureOpenAI
 from tqdm import tqdm
 
-from utils import build_prompt
-from main import DATASET_DICT, EVAL_SPLIT
-
+from configs import DATASET_CONFIGS
 
 assert 'OPENAI_API_KEY' in os.environ
 client = AzureOpenAI(
     api_key=os.environ.get('OPENAI_API_KEY'),
-    azure_endpoint='https://east-us-2-llm.openai.azure.com/',
-    api_version='2023-05-15',
-    azure_deployment='misc-gpt4-turbo'
+    azure_endpoint=os.environ.get('OPENAI_AZURE_ENDPOINT', None),
+    api_version=os.environ.get('OPENAI_API_VERSION', None),
+    azure_deployment=os.environ.get('OPENAI_AZURE_DEPLOYMENT', None)
 )
 
 
-# Figure 4 from https://arxiv.org/pdf/2311.06233.pdf
-# THREE_PARAPHRASE_INSTRUCTION = ("""
-# Instruction: Your task is to create a three-choice quiz by only replacing the words in the provided text with their synonyms. The meaning and sentence structure of the three new options must exactly mirror every detail in the text. You must not include the provided text as an option. You must make sure that:
-# (1) You generate three distinct options based on the provided text;
-# (2) Options are ordered;
-# (3) There is not any extra explanation; and
-# (4) You comply with every specific symbol and letter detail in the given text.
-# """).strip()
-
-
+# Adapted from Figure 4 from https://arxiv.org/pdf/2311.06233.pdf
 THREE_PARAPHRASE_INSTRUCTION = ("""
 Instruction: Your task is to generate 3 distinct paraphrases of the following {} by only replacing the words in the provided text with their synonyms. The meaning and sentence structure of the three paraphrases must exactly mirror every detail in the text. You must make sure that:
 (1) You generate three distinct paraphrases;
@@ -47,7 +36,13 @@ def chatgpt(messages, model='gpt-4', temperature=0.1, max_tokens=2048):
         model=model, messages=messages, temperature=temperature, max_tokens=max_tokens,
         response_format={'type': 'json_object'}
     )
-    obj = json.loads(completion.choices[0].message.content)
+    raw = completion.choices[0].message.content
+    try:
+        obj = json.loads(raw)
+    except Exception as e:
+        print(e)
+        return None
+
     if type(obj) == list:
         return obj
 
@@ -126,7 +121,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
 
     parser.add_argument('--model', default='gpt-4')
-    parser.add_argument('--dataset', default='pubmedqa', choices=list(DATASET_DICT.keys()))
+    parser.add_argument('--dataset', default='pubmedqa', choices=list(DATASET_CONFIGS.keys()))
     parser.add_argument('--max_examples', default=100, type=int)
 
     parser.add_argument('-overwrite', default=False, action='store_true')
@@ -136,11 +131,11 @@ if __name__ == '__main__':
 
     args = parser.parse_args()
 
-    args.split = EVAL_SPLIT[args.dataset]
-    cache_dir = os.path.join('results', 'neighbors', f'{args.dataset}_{args.split}')
+    d_config = DATASET_CONFIGS[args.dataset]
+    cache_dir = os.path.join('results', 'neighbors', f'{d_config.name}_{d_config.eval_split}')
     os.makedirs(cache_dir, exist_ok=True)
 
-    dataset = load_dataset(*DATASET_DICT[args.dataset])[args.split]
+    dataset = load_dataset(*d_config.huggingface_path)[args.split]
 
     if len(dataset) > args.max_examples:
         idxs = np.arange(len(dataset))
@@ -149,8 +144,6 @@ if __name__ == '__main__':
         print(f'Selecting a random subset of {args.max_examples} from {len(dataset)} examples.')
         dataset = dataset.select(idxs[:args.max_examples])
 
-
-    new_cols = []
     for idx, example in tqdm(enumerate(dataset), total=len(dataset)):
         out_fn = os.path.join(cache_dir, f'{idx}.json')
         if os.path.exists(out_fn):
@@ -158,23 +151,22 @@ if __name__ == '__main__':
             with open(out_fn, 'r') as fd:
                 obj = json.load(fd)
         else:
-            if args.dataset == 'pubmedqa':
+            if d_config.name == 'pubmedqa':
                 obj = gen_pubmedqa_neighbor_prompt(example)
-            elif args.dataset == 'medmcqa':
+            elif d_config.name == 'medqa':
+                obj = gen_mcqa_neighbor_prompt(example, q_col='sent1')
+            elif d_config.name == 'medmcqa':
                 obj = gen_mcqa_neighbor_prompt(example, q_col='question')
-            elif 'mmlu' in args.dataset:
+            elif 'mmlu' in d_config.name:
                 obj = gen_mcqa_neighbor_prompt(example, q_col='input')
+            else:
+                raise Exception(f'Unrecognized dataset {d_config.name}')
+            
             if obj is None:
                 print(f'Unable to process {idx}...Moving on for now')
             else:
                 print(f'Saving parsed to {out_fn}')
                 with open(out_fn, 'w') as fd:
                     json.dump(obj, fd)
-        
-        new_cols.append(obj)
 
-    # dataset_w_new_cols = dataset.map(lambda _, idx: new_cols[idx], with_indices=True)
-
-    # out_dir = f'results/neighbors_{args.dataset}'
-    # print(f'Saving to {out_dir}')
-    # dataset_w_new_cols.save_to_disk(out_dir)
+    print('All done!')

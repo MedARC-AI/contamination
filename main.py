@@ -1,82 +1,37 @@
+import argparse
 import json
 import math
 import os
 import zlib
 
-import argparse
-from datasets import load_dataset
-from evaluate import load
 import numpy as np
 import pandas as pd
 import torch
+from datasets import load_dataset
+from evaluate import load
+from Levenshtein import ratio
 from tqdm import tqdm
-from transformers import AutoTokenizer, AutoModelForCausalLM
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from utils import *
-
-
-INPUT_TYPE_DICT = {
-    'pubmedqa': 'a set of relevant PubMed abstracts',
-    'medmcqa': 'a set of multiple choice options and an answer',
-    'mmlu_clinical_knowledge': 'a set of multiple choice options and an answer',
-    'mmlu_anatomy': 'a set of multiple choice options and an answer',
-    'mmlu_medical_genetics': 'a set of multiple choice options and an answer',
-    'mmlu_professional_medicine': 'a set of multiple choice options and an answer',
-    'mmlu_college_biology': 'a set of multiple choice options and an answer',
-    'mmlu_college_medicine': 'a set of multiple choice options and an answer',
-}
+from configs import DATASET_CONFIGS, MODEL_CONFIGS
+from templates import *
 
 
-MODEL_DICT = {
-    'debug': 'HuggingFaceM4/tiny-random-LlamaForCausalLM',
-    'mixtral': 'mistralai/Mixtral-8x7B-v0.1',
-    'zephyr-7b': 'HuggingFaceH4/zephyr-7b-beta',
-    'yi-34b': '01-ai/Yi-34B-Chat',
-    'llama2-70b': 'meta-llama/Llama-2-70b-hf',
-    'qwen': 'Qwen/Qwen-72B',
-}
+def load_model(m_config):
+    if 'qwen' in m_config.name or '70b' in m_config.name or 'mixtral' in m_config.name:
+        # These need to be distributed across multiple GPUs
+        model = AutoModelForCausalLM.from_pretrained(
+            m_config.huggingface_path, device_map='auto', trust_remote_code=True
+        )
+    else:
+        model = AutoModelForCausalLM.from_pretrained(
+            m_config.huggingface_path, attn_implementation='flash_attention_2',
+            torch_dtype=torch.bfloat16, trust_remote_code=True
+        ).to('cuda')
+    return model.eval()
 
 
-IS_CHAT = {
-    'debug': False,
-    'mixtral': False,
-    'zephyr-7b': True,
-    'yi-34b': True,
-    'llama2-70b': False,
-    'qwen': False,
-}
-
-
-DATASET_DICT = {
-    'pubmedqa': ('bigbio/pubmed_qa', 'pubmed_qa_labeled_fold0_source'),
-    'medmcqa': ('medmcqa', ),
-    'mmlu_clinical_knowledge': ('lukaemon/mmlu', 'clinical_knowledge'),
-    'mmlu_anatomy': ('lukaemon/mmlu', 'anatomy'),
-    'mmlu_medical_genetics': ('lukaemon/mmlu', 'medical_genetics'),
-    'mmlu_professional_medicine': ('lukaemon/mmlu', 'professional_medicine'),
-    'mmlu_college_biology': ('lukaemon/mmlu', 'college_biology'),
-    'mmlu_college_medicine': ('lukaemon/mmlu', 'college_medicine'),
-}
-
-
-EVAL_SPLIT = {
-    'pubmedqa': 'test',
-    'medmcqa': 'validation',
-    'mmlu_clinical_knowledge': 'test',
-    'mmlu_anatomy': 'test',
-    'mmlu_medical_genetics': 'test',
-    'mmlu_professional_medicine': 'test',
-    'mmlu_college_biology': 'test',
-    'mmlu_college_medicine': 'test',
-}
-
-
-QUIZ_TEMPLATE = 'Your task is to accurately select the option that corresponds exactly to an instance from the {} split of the {} dataset. Only generate a single option letter as your answer.'
-GUIDED_TEMPLATE = 'Instruction: You are provided with {} from the {} split of the {} dataset. Given a target answer, generate the question as it appears in the dataset.'
-GENERAL_TEMPLATE = 'Instruction: Generate a question given {} and a given a target answer.'
-
-
-def chat_completion(message, model, tokenizer, is_chat=False):
+def chat_completion(message, model, tokenizer, max_new_tokens=256, is_chat=False):
     messages = [
         {'role': 'user', 'content': message},
     ]
@@ -91,7 +46,7 @@ def chat_completion(message, model, tokenizer, is_chat=False):
         prompt_len = inputs.shape[1]
 
     with torch.no_grad():
-        output_ids = model.generate(inputs, max_new_tokens=256, do_sample=False, top_k=None)
+        output_ids = model.generate(inputs, max_new_tokens=max_new_tokens, do_sample=False, top_k=None)
     completion_ids = output_ids.tolist()[0][prompt_len:]
     generated_text = tokenizer.decode(completion_ids, skip_special_tokens=True)
     return generated_text
@@ -102,7 +57,6 @@ def end2end(prompt, model, tokenizer):
         prompt,
         max_length=4096,
         truncation=True,
-        # return_attention_mask=False,
         return_tensors='pt'
     )
 
@@ -130,49 +84,11 @@ def construct_quiz(instruction, paras, original):
     return prompt, option_letters, original_letter
 
 
-def construct_pubmedqa_qg_input(example):
-    # Specific to each dataset
-    inputs = '\n'.join(example['CONTEXTS'])
-    answer = example['final_decision']
-    return f'{inputs}\n\nAnswer: {answer}\n\nQuestion: '
-
-
-def construct_medmcqa_qg_input(example):
-    choice_letters = ['A', 'B', 'C', 'D']
-    choice_options = [
-        example['opa'],
-        example['opb'],
-        example['opc'],
-        example['opd'],
-    ]
-
-    target = choice_letters[example['cop']]
-    prompt_lines = ['OPTIONS']
-    for l, o in zip(choice_letters, choice_options):
-        prompt_lines.append(f'{l}) {o}')
-    prompt_lines.append(f'ANSWER: {target}')
-    prompt_lines.append('QUESTION: ')
-    return '\n'.join(prompt_lines)
-
-
-def construct_mmlu_qg_input(example):
-    choice_letters = ['A', 'B', 'C', 'D']
-    choice_options = [example[l] for l in choice_letters]
-
-    target = example['target']
-    prompt_lines = ['OPTIONS']
-    for l, o in zip(choice_letters, choice_options):
-        prompt_lines.append(f'{l}) {o}')
-    prompt_lines.append(f'ANSWER: {target}')
-    prompt_lines.append('QUESTION: ')
-    return '\n'.join(prompt_lines)
-
-
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
 
-    parser.add_argument('--model', default='mistral', choices=list(MODEL_DICT.keys()))
-    parser.add_argument('--dataset', default='pubmedqa', choices=list(DATASET_DICT.keys()))
+    parser.add_argument('--model', default='mistral', choices=list(MODEL_CONFIGS.keys()))
+    parser.add_argument('--dataset', default='pubmedqa', choices=list(DATASET_CONFIGS.keys()))
     parser.add_argument('--device', default='cuda')
     parser.add_argument('-overwrite', default=False, action='store_true')
     parser.add_argument('--max_examples', default=100, type=int)
@@ -188,46 +104,41 @@ if __name__ == '__main__':
 
     args = parser.parse_args()
 
-    args.split = EVAL_SPLIT[args.dataset]
-    print(f'Treating {args.split} as the evaluation split...')
-    dataset = load_dataset(*DATASET_DICT[args.dataset])[args.split]
-    is_chat = IS_CHAT[args.model]
+    d_config = DATASET_CONFIGS[args.dataset]
+    m_config = MODEL_CONFIGS[args.model]
 
-    if len(dataset) > args.max_examples:
+    print(f'Treating {d_config.eval_split} as the evaluation split...')
+    dataset = load_dataset(*d_config.huggingface_path)[d_config.eval_split]
+    n = len(dataset)
+
+    if n > args.max_examples:
         idxs = np.arange(len(dataset))
         np.random.seed(1992)
         np.random.shuffle(idxs)
-        print(f'Selecting a random subset of {args.max_examples} from {len(dataset)} examples.')
+        print(f'Selecting a random subset of {args.max_examples} from {n} examples.')
         dataset = dataset.select(idxs[:args.max_examples])
+        n = len(dataset)
 
-    quiz_instruction = QUIZ_TEMPLATE.format(args.split, args.dataset)
-    guided_instruction = GUIDED_TEMPLATE.format(INPUT_TYPE_DICT[args.dataset], args.split, args.dataset)
-    general_instruction = GENERAL_TEMPLATE.format(INPUT_TYPE_DICT[args.dataset])
+    quiz_instruction = QUIZ_TEMPLATE.format(d_config.eval_split, d_config.name)
+    guided_instruction = GUIDED_TEMPLATE.format(d_config.input_description, d_config.eval_split, d_config.name)
+    general_instruction = GENERAL_TEMPLATE.format(d_config.input_description)
 
     rouge = load('rouge', keep_in_memory=True)
 
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_DICT[args.model], trust_remote_code=True)
-
-    if 'qwen' in args.model or '70b' in args.model or 'mixtral' in args.model:
-        model = AutoModelForCausalLM.from_pretrained(
-            MODEL_DICT[args.model], device_map='auto', trust_remote_code=True
-        ).eval()
-    else:
-        model = AutoModelForCausalLM.from_pretrained(
-            MODEL_DICT[args.model], attn_implementation='flash_attention_2',
-            torch_dtype=torch.bfloat16, trust_remote_code=True
-        ).eval().to('cuda')
+    tokenizer = AutoTokenizer.from_pretrained(m_config.huggingface_path, trust_remote_code=True)
+    model = load_model(m_config)
 
     stats = []
 
-    out_dir = os.path.join('results', f'{args.model}_{args.dataset}')
+    out_dir = os.path.join('results', f'{m_config.name}_{d_config.name}')
     os.makedirs(out_dir, exist_ok=True)
-    out_fn = out_dir + '.csv'
+    out_fn = f'{out_dir}.csv'
 
-    for idx, example in tqdm(enumerate(dataset), total=len(dataset)):
-        prompt = build_prompt(example, dataset_name=args.dataset)
+    for idx, example in tqdm(enumerate(dataset), total=n):
+        prompt = d_config.prompt_generator(example, dataset_name=d_config.name)
+
         ex_fn = os.path.join(out_dir, f'{idx}.json')
-        neighbor_fn = os.path.join('results', 'neighbors', f'{args.dataset}_{args.split}', )
+        neighbor_fn = os.path.join('results', 'neighbors', f'{d_config.name}_{args.split}', f'{idx}.json')
 
         if os.path.exists(ex_fn) and not args.overwrite:
             print(f'Reading in datapoint from {ex_fn}')
@@ -239,28 +150,42 @@ if __name__ == '__main__':
                 n_para = 0
             else:
                 with open(neighbor_fn, 'r') as fd:
-                    paraphrases = json.load(neighbor_fn)
-                paraphrase_prompts = build_paraphrase_prompts(example, dataset_name=args.dataset, paraphrases=paraphrases)
-                n_para = len(paraphrase_prompts)
-                assert n_para >= 3  # Necessary for 4-choice quiz
-                para_outputs = [
-                    end2end(pp, model, tokenizer) for pp in paraphrase_prompts
-                ]
+                    paraphrases = json.load(fd)
+
+                paraphrase_prompts = d_config.paraphrase_prompt_generator(
+                    example, dataset_name=d_config.name, paraphrases=paraphrases
+                )
+
+                if paraphrase_prompts is None:
+                    print(paraphrases)
+                    print('Invalid paraphrases...')
+                    paraphrase_prompts = para_outputs = None
+                    n_para = 0
+                else:
+                    n_para = len(paraphrase_prompts)
+                    assert n_para >= 3  # Necessary for 4-choice quiz
+                    para_outputs = [
+                        end2end(pp, model, tokenizer) for pp in paraphrase_prompts
+                    ]
 
             # PAPER: Time Travel in LLMs: Tracing Data Contamination in Large Language Models
             # LINK: https://arxiv.org/abs/2308.08493
-            if args.dataset == 'pubmedqa':
-                partial_input = construct_pubmedqa_qg_input(example)
-                reference = example['QUESTION']
-            elif args.dataset == 'medmcqa':
-                partial_input = construct_medmcqa_qg_input(example)
-                reference = example['question']
-            elif 'mmlu' in args.dataset:
-                partial_input = construct_mmlu_qg_input(example)
-                reference = example['input']
+            partial_input = d_config.qg_prompt_generator(example)
+            reference = example[d_config.question_col]
 
-            guided_q = chat_completion(f'{guided_instruction}\n\n{partial_input}', model, tokenizer)
-            general_q = chat_completion(f'{general_instruction}\n\n{partial_input}', model, tokenizer)
+            q_toks = reference.split(' ')
+            mid = len(q_toks) // 2
+            remaining = len(q_toks) - mid
+            first_half = ' '.join(q_toks[:mid])
+            second_half = ' '.join(q_toks[mid:])
+            completion_prompt = f'Finish the following question using {mid} tokens.\nQuestion: {first_half}'
+            
+            completed = chat_completion(completion_prompt, model, tokenizer, max_new_tokens=64, is_chat=m_config.is_chat)
+            completed = ' '.join(completed.split(' ')[:remaining])
+            lev_ratio = ratio(second_half, completed)
+
+            guided_q = chat_completion(f'{guided_instruction}\n\n{partial_input}', model, tokenizer, is_chat=m_config.is_chat)
+            general_q = chat_completion(f'{general_instruction}\n\n{partial_input}', model, tokenizer, is_chat=m_config.is_chat)
             guided_rouge, general_rouge  = rouge.compute(
                 predictions=[guided_q, general_q], references=[reference, reference],
                 use_aggregator=False, rouge_types=['rougeL']
@@ -289,18 +214,25 @@ if __name__ == '__main__':
             if paraphrase_prompts is not None:
                 quiz_prompt, option_letters, original_letter = construct_quiz(quiz_instruction, paraphrase_prompts[:min(n_para, 3)], prompt)
                 quiz_output, _ = end2end(quiz_prompt, model, tokenizer)
-                option_ids = tokenizer.convert_tokens_to_ids([' ' + l for l in option_letters])
+                if 'qwen' in m_config.name.lower():
+                    option_ids = []
+                    for l in option_letters:
+                        option_ids += tokenizer.encode(l)
+                else:
+                    option_ids = tokenizer.convert_tokens_to_ids(option_letters)
                 quiz_final_logit = quiz_output.logits[0, -1, :]
-                quiz_pred_letter = option_letters[int(torch.argmax(quiz_final_logit[option_ids]))]
+                preds = quiz_final_logit[option_ids]
+                assert min(preds) < max(preds)
+                quiz_pred_letter = option_letters[int(torch.argmax(preds))]
                 quiz_score = 1 if quiz_pred_letter == original_letter else 0
 
             neighbor_loss_delta = None
             if paraphrase_prompts is not None:
                 # PAPER: Membership Inference Attacks against Language Models via Neighbourhood Comparison
                 # LINK: https://aclanthology.org/2023.findings-acl.719.pdf
-                avg_para_loss = float(np.mean([po.loss for po in para_outputs]))
+                avg_para_loss = float(np.mean([po[0].loss.cpu().item() for po in para_outputs]))
                 # CrossEntropyLoss(original) - Mean(CrossEntropyLoss(p) for p in paraphrased)
-                neighbor_loss_delta = outputs.loss - avg_para_loss
+                neighbor_loss_delta = float((outputs.loss - avg_para_loss).item())
 
             # PAPER: Extracting Training Data from Large Language Models
             # LINK: https://arxiv.org/abs/2012.07805
@@ -320,7 +252,8 @@ if __name__ == '__main__':
                 'neighbor_loss_delta': neighbor_loss_delta,
                 'ppl': orig_ppl,
                 'lower_ratio': lower_ratio,
-                'zlib_lratio': zlib_lratio
+                'zlib_lratio': zlib_lratio,
+                'lev_ratio': lev_ratio
             }
 
             with open(ex_fn, 'w') as fd:

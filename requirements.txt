@@ -2,6 +2,7 @@ accelerate
 datasets
 einops
 evaluate
+python-Levenshtein
 flash-attn --no-build-isolation
 huggingface
 pandas

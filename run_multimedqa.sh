@@ -9,5 +9,5 @@ DATASETS=(
 for dataset in "${DATASETS[@]}"
 do
     echo "Starting $dataset for $MODEL..."
-    python3 main.py --dataset $dataset --model $MODEL -no_neighbors -overwrite
+    python3 main.py --dataset $dataset --model $MODEL -overwrite
 done
